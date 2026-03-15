@@ -71,6 +71,26 @@ export async function getToken() {
   return tokenCache;
 }
 
+// Fetches every page of a paginated endpoint and returns all items combined.
+// path must contain {pageSize} and {pageNumber} placeholders.
+export async function fetchAllPages(pathTemplate, { query = {}, pageSize = 200 } = {}) {
+  const allItems = [];
+  let page = 1;
+  let total = null;
+
+  do {
+    const path = pathTemplate
+      .replace("{pageSize}", pageSize)
+      .replace("{pageNumber}", page);
+    const result = await apiFetch(path, { query });
+    if (total === null) total = result.totalResults ?? result.items?.length ?? 0;
+    allItems.push(...(result.items ?? []));
+    page++;
+  } while (allItems.length < total);
+
+  return { totalResults: total, items: allItems };
+}
+
 export async function apiFetch(path, { method = "GET", query = {}, body } = {}) {
   const token = await getToken();
 

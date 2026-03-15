@@ -8,7 +8,7 @@ dotenv.config({ path: join(__dirname, "../.env") });
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { apiFetch, hasCredentials, testAndSaveCredentials } from "./auth.js";
+import { apiFetch, fetchAllPages, hasCredentials, testAndSaveCredentials } from "./auth.js";
 
 const server = new McpServer(
   {
@@ -54,6 +54,17 @@ Default pageSize is 50; maximum is 200.
 ## Language
 The system is Swedish. Property, contract, and tenant names will appear in Swedish.
 Dates use ISO 8601. Currency is SEK.
+
+## Pagination & large queries
+Regular list tools return one page at a time. For questions that require scanning all data
+(e.g. "find all tenants with multiple contracts", "show overdue tenants", "portfolio overview"),
+use the dedicated analytical tools instead — they handle all pagination internally and return
+aggregated results in a single call:
+- find_tenants_with_multiple_contracts
+- find_vacant_dwellings
+- summarize_invoices_by_status
+- find_overdue_tenants
+- count_objects_by_property
 
 ## Credentials
 If a tool returns NOT_CONFIGURED, ask the user for their username and password and call the configure tool.
@@ -794,6 +805,212 @@ server.registerTool(
   },
   async ({ externalSystem, leaseAgreementId }) =>
     ok(await apiFetch(`/api/v1/esignature-errand/${externalSystem}/${leaseAgreementId}`))
+);
+
+// ─── Analytical tools (multi-page, server-side aggregation) ──────────────────
+
+server.registerTool(
+  "find_tenants_with_multiple_contracts",
+  {
+    description: "Fetch all lease agreements and return only tenants who have more than one contract. Handles all pagination internally — single tool call regardless of dataset size.",
+    inputSchema: {
+      companyId: z.string().uuid().optional().describe("Limit to a specific company"),
+      status: z
+        .enum(["draft", "coming", "valid", "terminated", "expired", "voided", "active"])
+        .optional()
+        .describe("Filter by contract status, e.g. 'active' for currently active only"),
+      category: z
+        .enum(["dwelling", "premises", "parking", "other", "block", "cooperativeHousing"])
+        .optional()
+        .describe("Filter by contract category"),
+    },
+  },
+  async ({ companyId, status, category }) => {
+    const { items, totalResults } = await fetchAllPages(
+      "/api/v1/leaseagreement/{pageSize}/{pageNumber}",
+      {
+        query: {
+          "filter.companyId": companyId,
+          "filter.status": status,
+          "filter.category": category,
+        },
+      }
+    );
+
+    // Group contracts by tenant (using all tenant contact IDs on the contract)
+    const byTenant = new Map();
+    for (const contract of items) {
+      const tenants = [contract.tenantOne, contract.tenantTwo].filter(Boolean);
+      for (const tenant of tenants) {
+        const key = tenant.contactId ?? tenant.identification ?? tenant.name ?? "unknown";
+        if (!byTenant.has(key)) byTenant.set(key, { tenant, contracts: [] });
+        byTenant.get(key).contracts.push({
+          id: contract.id,
+          status: contract.status,
+          category: contract.category,
+          rentalObjectId: contract.rentalObjectId,
+          fromDate: contract.fromDate,
+          toDate: contract.toDate,
+        });
+      }
+    }
+
+    const result = [...byTenant.values()]
+      .filter((t) => t.contracts.length > 1)
+      .sort((a, b) => b.contracts.length - a.contracts.length);
+
+    return ok({
+      totalContractsScanned: totalResults,
+      tenantsWithMultipleContracts: result.length,
+      tenants: result,
+    });
+  }
+);
+
+server.registerTool(
+  "find_vacant_dwellings",
+  {
+    description: "Fetch all dwellings and return only those currently vacant (no active lease). Handles all pagination internally.",
+    inputSchema: {
+      companyId: z.string().uuid().optional().describe("Limit to a specific company"),
+      propertyId: z.string().uuid().optional().describe("Limit to a specific property"),
+    },
+  },
+  async ({ companyId, propertyId }) => {
+    const { items: dwellings, totalResults } = await fetchAllPages(
+      "/api/v1/dwelling/{pageSize}/{pageNumber}",
+      { query: { "filter.companyId": companyId, "filter.propertyId": propertyId } }
+    );
+
+    const vacant = dwellings.filter(
+      (d) => d.leasingStatus === "availableToday" || d.leasingStatus === "availableInTheFuture" || !d.currentLeaseAgreementId
+    );
+
+    return ok({
+      totalDwellingsScanned: totalResults,
+      vacantCount: vacant.length,
+      dwellings: vacant,
+    });
+  }
+);
+
+server.registerTool(
+  "summarize_invoices_by_status",
+  {
+    description: "Fetch all invoices and return a summary grouped by payment status (unpaid, overdue, fullyPaid, partiallyPaid) with totals. Handles all pagination internally.",
+    inputSchema: {
+      companyId: z.string().uuid().optional().describe("Limit to a specific company"),
+      invoiceDateFrom: z.string().datetime().optional().describe("Only include invoices from this date onwards"),
+    },
+  },
+  async ({ companyId, invoiceDateFrom }) => {
+    const { items, totalResults } = await fetchAllPages(
+      "/api/v1/invoice/{pageSize}/{pageNumber}",
+      { query: { "filter.companyId": companyId, "filter.invoiceDateFrom": invoiceDateFrom } }
+    );
+
+    const summary = {};
+    for (const inv of items) {
+      const status = inv.paymentStatus ?? "unknown";
+      if (!summary[status]) summary[status] = { count: 0, totalAmount: 0 };
+      summary[status].count++;
+      summary[status].totalAmount += inv.totalAmount ?? inv.amount ?? 0;
+    }
+
+    return ok({
+      totalInvoicesScanned: totalResults,
+      byCurrency: "SEK",
+      summary,
+    });
+  }
+);
+
+server.registerTool(
+  "find_overdue_tenants",
+  {
+    description: "Fetch all overdue invoices and group them by tenant, showing total overdue amount per tenant. Handles all pagination internally.",
+    inputSchema: {
+      companyId: z.string().uuid().optional().describe("Limit to a specific company"),
+    },
+  },
+  async ({ companyId }) => {
+    const { items, totalResults } = await fetchAllPages(
+      "/api/v1/invoice/{pageSize}/{pageNumber}",
+      { query: { "filter.companyId": companyId, "filter.paymentStatus": "overdue" } }
+    );
+
+    const byTenant = new Map();
+    for (const inv of items) {
+      const key = inv.recipientContactId ?? "unknown";
+      if (!byTenant.has(key)) {
+        byTenant.set(key, {
+          contactId: inv.recipientContactId,
+          contactName: inv.recipientName ?? null,
+          overdueInvoices: 0,
+          totalOverdueAmount: 0,
+          invoices: [],
+        });
+      }
+      const t = byTenant.get(key);
+      t.overdueInvoices++;
+      t.totalOverdueAmount += inv.totalAmount ?? inv.amount ?? 0;
+      t.invoices.push({ id: inv.id, dueDate: inv.dueDate, amount: inv.totalAmount ?? inv.amount });
+    }
+
+    const tenants = [...byTenant.values()].sort(
+      (a, b) => b.totalOverdueAmount - a.totalOverdueAmount
+    );
+
+    return ok({
+      totalOverdueInvoices: totalResults,
+      currency: "SEK",
+      tenantCount: tenants.length,
+      tenants,
+    });
+  }
+);
+
+server.registerTool(
+  "count_objects_by_property",
+  {
+    description: "Fetch all dwellings, parking, and premises and return a count per property. Useful for getting a portfolio overview. Handles all pagination internally.",
+    inputSchema: {
+      companyId: z.string().uuid().optional().describe("Limit to a specific company"),
+    },
+  },
+  async ({ companyId }) => {
+    const query = { "filter.companyId": companyId };
+
+    const [dwellings, parking, premises, otherRental] = await Promise.all([
+      fetchAllPages("/api/v1/dwelling/{pageSize}/{pageNumber}", { query }),
+      fetchAllPages("/api/v1/parking/{pageSize}/{pageNumber}", { query }),
+      fetchAllPages("/api/v1/premises/{pageSize}/{pageNumber}", { query }),
+      fetchAllPages("/api/v1/otherRentalObject/{pageSize}/{pageNumber}", { query }),
+    ]);
+
+    const byProperty = new Map();
+    const add = (items, type) => {
+      for (const item of items) {
+        const key = item.propertyId ?? "unknown";
+        if (!byProperty.has(key)) byProperty.set(key, { propertyId: key, propertyName: item.propertyName ?? null, dwellings: 0, parking: 0, premises: 0, other: 0 });
+        byProperty.get(key)[type]++;
+      }
+    };
+    add(dwellings.items, "dwellings");
+    add(parking.items, "parking");
+    add(premises.items, "premises");
+    add(otherRental.items, "other");
+
+    return ok({
+      totals: {
+        dwellings: dwellings.totalResults,
+        parking: parking.totalResults,
+        premises: premises.totalResults,
+        other: otherRental.totalResults,
+      },
+      byProperty: [...byProperty.values()],
+    });
+  }
 );
 
 // ─── Start ────────────────────────────────────────────────────────────────────
