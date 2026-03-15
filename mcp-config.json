@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "dinhyresvard": {
+      "command": "node",
+      "args": ["/Users/maximiliansvensson/Documents/DH_mcp/src/index.js"],
+      "env": {
+        "DH_USERNAME": "YOUR_USERNAME",
+        "DH_PASSWORD": "YOUR_PASSWORD"
+      }
+    }
+  }
+}
