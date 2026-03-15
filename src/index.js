@@ -4,10 +4,13 @@ import { dirname, join } from "path";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 dotenv.config({ path: join(__dirname, "../.env") });
+
+// Must be imported after dotenv so env vars are loaded first
+
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { apiFetch } from "./auth.js";
+import { apiFetch, hasCredentials, testAndSaveCredentials } from "./auth.js";
 
 const server = new McpServer({
   name: "dinhyresvard",
@@ -24,6 +27,43 @@ const pageParams = {
 function ok(data) {
   return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
 }
+
+const NOT_CONFIGURED = {
+  content: [{ type: "text", text: "NOT_CONFIGURED: Please ask the user for their DinHyresvärd username and password, then call the `configure` tool to save them." }],
+};
+
+function guarded(fn) {
+  return async (args) => {
+    if (!hasCredentials()) return NOT_CONFIGURED;
+    try {
+      return await fn(args);
+    } catch (err) {
+      if (err.message === "NOT_CONFIGURED") return NOT_CONFIGURED;
+      throw err;
+    }
+  };
+}
+
+// ─── Configure (runs unauthenticated) ────────────────────────────────────────
+
+server.registerTool(
+  "configure",
+  {
+    description: "Save DinHyresvärd credentials. Call this when the user provides their username and password.",
+    inputSchema: {
+      username: z.string().describe("DinHyresvärd username"),
+      password: z.string().describe("DinHyresvärd password"),
+    },
+  },
+  async ({ username, password }) => {
+    await testAndSaveCredentials(username, password);
+    return ok({ success: true, message: `Credentials saved for user "${username}". You can now use all DinHyresvärd tools.` });
+  }
+);
+
+// All tools registered below are automatically guarded
+const _registerTool = server.registerTool.bind(server);
+server.registerTool = (name, config, cb) => _registerTool(name, config, guarded(cb));
 
 // ─── Companies ───────────────────────────────────────────────────────────────
 
